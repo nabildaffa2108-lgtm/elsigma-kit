@@ -1,0 +1,414 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Buat file project
+        run: |
+          mkdir -p src/main/java/com/elsigma/kit src/main/resources
+          cat > settings.gradle <<'EOF_FILE_0'
+          pluginManagement {
+              repositories {
+                  maven { name = 'Fabric'; url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          EOF_FILE_0
+          cat > gradle.properties <<'EOF_FILE_1'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+
+          # ====== CEK / SAMAKAN versi ini di https://fabricmc.net/develop (pilih 1.21.11) ======
+          minecraft_version=1.21.11
+          loader_version=0.18.2
+          loom_version=1.14-SNAPSHOT
+          fabric_api_version=0.141.0+1.21.11
+
+          mod_version=1.0.0
+          maven_group=com.elsigma
+          archives_base_name=elsigma-kit
+          EOF_FILE_1
+          cat > build.gradle <<'EOF_FILE_2'
+          plugins {
+              id 'fabric-loom' version "${loom_version}"
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings loom.officialMojangMappings()
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": inputs.properties.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+          }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF_FILE_2
+          cat > src/main/resources/fabric.mod.json <<'EOF_FILE_3'
+          {
+            "schemaVersion": 1,
+            "id": "elsigma_kit",
+            "version": "${version}",
+            "name": "Elsigma Kit",
+            "description": "Simpan inventory (termasuk armor & offhand) sebagai kit. /kit add <nama>, /kits untuk membuka GUI.",
+            "authors": ["Elsigma"],
+            "license": "MIT",
+            "environment": "*",
+            "entrypoints": {
+              "main": ["com.elsigma.kit.ElsigmaKit"]
+            },
+            "depends": {
+              "fabricloader": ">=0.16.0",
+              "minecraft": "~1.21.11",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF_FILE_3
+          cat > src/main/java/com/elsigma/kit/ElsigmaKit.java <<'EOF_FILE_4'
+          package com.elsigma.kit;
+
+          import net.fabricmc.api.ModInitializer;
+          import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+
+          public class ElsigmaKit implements ModInitializer {
+              public static final String MOD_ID = "elsigma_kit";
+              public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
+
+              @Override
+              public void onInitialize() {
+                  CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) ->
+                          KitCommands.register(dispatcher));
+                  LOGGER.info("Elsigma Kit dimuat.");
+              }
+          }
+          EOF_FILE_4
+          cat > src/main/java/com/elsigma/kit/KitStorage.java <<'EOF_FILE_5'
+          package com.elsigma.kit;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import com.google.gson.JsonElement;
+          import com.google.gson.JsonObject;
+          import com.google.gson.JsonParser;
+          import com.mojang.serialization.JsonOps;
+          import net.minecraft.resources.RegistryOps;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.entity.player.Inventory;
+          import net.minecraft.world.item.ItemStack;
+          import net.minecraft.world.level.storage.LevelResource;
+
+          import java.io.IOException;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.LinkedHashMap;
+          import java.util.Map;
+          import java.util.UUID;
+
+          /** Menyimpan kit per-player ke folder dunia: <world>/elsigma_kit/<uuid>.json */
+          public final class KitStorage {
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+              private KitStorage() {}
+
+              private static Path file(MinecraftServer server, UUID id) throws IOException {
+                  Path dir = server.getWorldPath(LevelResource.ROOT).resolve("elsigma_kit");
+                  Files.createDirectories(dir);
+                  return dir.resolve(id + ".json");
+              }
+
+              public static LinkedHashMap<String, JsonObject> read(MinecraftServer server, UUID id) {
+                  LinkedHashMap<String, JsonObject> kits = new LinkedHashMap<>();
+                  try {
+                      Path f = file(server, id);
+                      if (!Files.exists(f)) return kits;
+                      JsonObject root = JsonParser.parseString(Files.readString(f)).getAsJsonObject();
+                      for (Map.Entry<String, JsonElement> e : root.entrySet()) {
+                          kits.put(e.getKey(), e.getValue().getAsJsonObject());
+                      }
+                  } catch (Exception ex) {
+                      ElsigmaKit.LOGGER.error("Gagal membaca kit", ex);
+                  }
+                  return kits;
+              }
+
+              public static void write(MinecraftServer server, UUID id, Map<String, JsonObject> kits) {
+                  try {
+                      JsonObject root = new JsonObject();
+                      for (Map.Entry<String, JsonObject> e : kits.entrySet()) root.add(e.getKey(), e.getValue());
+                      Files.writeString(file(server, id), GSON.toJson(root));
+                  } catch (IOException ex) {
+                      ElsigmaKit.LOGGER.error("Gagal menyimpan kit", ex);
+                  }
+              }
+
+              /** Ambil semua slot: hotbar, inventory, armor (36-39) dan offhand (40). */
+              public static JsonObject capture(MinecraftServer server, ServerPlayer player) {
+                  RegistryOps<JsonElement> ops = server.registryAccess().createSerializationContext(JsonOps.INSTANCE);
+                  Inventory inv = player.getInventory();
+                  JsonObject out = new JsonObject();
+                  for (int i = 0; i < inv.getContainerSize(); i++) {
+                      final int slot = i;
+                      ItemStack stack = inv.getItem(i);
+                      if (stack.isEmpty()) continue;
+                      ItemStack.CODEC.encodeStart(ops, stack).result()
+                              .ifPresent(json -> out.add(String.valueOf(slot), json));
+                  }
+                  return out;
+              }
+
+              /** Ganti seluruh inventory player dengan isi kit. */
+              public static void apply(MinecraftServer server, ServerPlayer player, JsonObject kit) {
+                  RegistryOps<JsonElement> ops = server.registryAccess().createSerializationContext(JsonOps.INSTANCE);
+                  Inventory inv = player.getInventory();
+                  inv.clearContent();
+                  for (Map.Entry<String, JsonElement> e : kit.entrySet()) {
+                      final int slot;
+                      try {
+                          slot = Integer.parseInt(e.getKey());
+                      } catch (NumberFormatException ex) {
+                          continue;
+                      }
+                      if (slot < 0 || slot >= inv.getContainerSize()) continue;
+                      ItemStack.CODEC.parse(ops, e.getValue()).result()
+                              .ifPresent(stack -> inv.setItem(slot, stack));
+                  }
+                  player.inventoryMenu.sendAllDataToRemote();
+              }
+          }
+          EOF_FILE_5
+          cat > src/main/java/com/elsigma/kit/KitMenu.java <<'EOF_FILE_6'
+          package com.elsigma.kit;
+
+          import com.google.gson.JsonObject;
+          import net.minecraft.ChatFormatting;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.Container;
+          import net.minecraft.world.entity.player.Inventory;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.inventory.ChestMenu;
+          import net.minecraft.world.inventory.ClickType;
+          import net.minecraft.world.inventory.MenuType;
+
+          import java.util.List;
+          import java.util.Map;
+
+          /** GUI chest 6 baris. Semua klik dibatalkan; klik pada netherite block = load kit. */
+          public class KitMenu extends ChestMenu {
+              private final List<String> names;
+              private final MinecraftServer server;
+
+              public KitMenu(int containerId, Inventory playerInventory, Container container,
+                             List<String> names, MinecraftServer server) {
+                  super(MenuType.GENERIC_9x6, containerId, playerInventory, container, 6);
+                  this.names = names;
+                  this.server = server;
+              }
+
+              @Override
+              public void clicked(int slotId, int button, ClickType clickType, Player player) {
+                  if (player instanceof ServerPlayer sp && slotId >= 0 && slotId < names.size()
+                          && slotId < 54 && clickType != ClickType.QUICK_CRAFT) {
+                      String name = names.get(slotId);
+                      Map<String, JsonObject> kits = KitStorage.read(server, sp.getUUID());
+                      JsonObject kit = kits.get(name);
+                      if (kit != null) {
+                          sp.closeContainer();
+                          KitStorage.apply(server, sp, kit);
+                          sp.sendSystemMessage(Component.literal("Kit '" + name + "' berhasil dimuat!")
+                                  .withStyle(ChatFormatting.GREEN));
+                          return;
+                      }
+                  }
+                  // batalkan semua interaksi lain (tidak boleh ambil/taruh item)
+                  this.sendAllDataToRemote();
+              }
+          }
+          EOF_FILE_6
+          cat > src/main/java/com/elsigma/kit/KitCommands.java <<'EOF_FILE_7'
+          package com.elsigma.kit;
+
+          import com.google.gson.JsonObject;
+          import com.mojang.brigadier.CommandDispatcher;
+          import com.mojang.brigadier.arguments.StringArgumentType;
+          import com.mojang.brigadier.context.CommandContext;
+          import com.mojang.brigadier.exceptions.CommandSyntaxException;
+          import net.minecraft.ChatFormatting;
+          import net.minecraft.commands.CommandSourceStack;
+          import net.minecraft.commands.Commands;
+          import net.minecraft.core.component.DataComponents;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.network.chat.Style;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.SimpleContainer;
+          import net.minecraft.world.SimpleMenuProvider;
+          import net.minecraft.world.item.ItemStack;
+          import net.minecraft.world.item.Items;
+          import net.minecraft.world.item.component.ItemLore;
+
+          import java.util.ArrayList;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+
+          public final class KitCommands {
+              private static final int MAX_KITS = 54;
+
+              private KitCommands() {}
+
+              public static void register(CommandDispatcher<CommandSourceStack> dispatcher) {
+                  dispatcher.register(Commands.literal("kit")
+                          .then(Commands.literal("add")
+                                  .then(Commands.argument("name", StringArgumentType.greedyString())
+                                          .executes(KitCommands::add)))
+                          .then(Commands.literal("load")
+                                  .then(Commands.argument("name", StringArgumentType.greedyString())
+                                          .executes(KitCommands::load)))
+                          .then(Commands.literal("delete")
+                                  .then(Commands.argument("name", StringArgumentType.greedyString())
+                                          .executes(KitCommands::delete))));
+
+                  dispatcher.register(Commands.literal("kits").executes(KitCommands::open));
+              }
+
+              private static int add(CommandContext<CommandSourceStack> ctx) throws CommandSyntaxException {
+                  CommandSourceStack src = ctx.getSource();
+                  ServerPlayer player = src.getPlayerOrException();
+                  MinecraftServer server = src.getServer();
+                  String name = StringArgumentType.getString(ctx, "name").trim();
+
+                  if (name.isEmpty() || name.length() > 32) {
+                      src.sendFailure(Component.literal("Nama kit harus 1-32 karakter."));
+                      return 0;
+                  }
+                  LinkedHashMap<String, JsonObject> kits = KitStorage.read(server, player.getUUID());
+                  if (!kits.containsKey(name) && kits.size() >= MAX_KITS) {
+                      src.sendFailure(Component.literal("Maksimal " + MAX_KITS + " kit."));
+                      return 0;
+                  }
+                  boolean overwrite = kits.containsKey(name);
+                  kits.put(name, KitStorage.capture(server, player));
+                  KitStorage.write(server, player.getUUID(), kits);
+
+                  src.sendSuccess(() -> Component.literal("Kit '" + name + "' "
+                          + (overwrite ? "diperbarui" : "disimpan")
+                          + " (semua item + armor + offhand).").withStyle(ChatFormatting.GREEN), false);
+                  return 1;
+              }
+
+              private static int load(CommandContext<CommandSourceStack> ctx) throws CommandSyntaxException {
+                  CommandSourceStack src = ctx.getSource();
+                  ServerPlayer player = src.getPlayerOrException();
+                  MinecraftServer server = src.getServer();
+                  String name = StringArgumentType.getString(ctx, "name").trim();
+
+                  JsonObject kit = KitStorage.read(server, player.getUUID()).get(name);
+                  if (kit == null) {
+                      src.sendFailure(Component.literal("Kit '" + name + "' tidak ditemukan."));
+                      return 0;
+                  }
+                  KitStorage.apply(server, player, kit);
+                  src.sendSuccess(() -> Component.literal("Kit '" + name + "' dimuat.")
+                          .withStyle(ChatFormatting.GREEN), false);
+                  return 1;
+              }
+
+              private static int delete(CommandContext<CommandSourceStack> ctx) throws CommandSyntaxException {
+                  CommandSourceStack src = ctx.getSource();
+                  ServerPlayer player = src.getPlayerOrException();
+                  MinecraftServer server = src.getServer();
+                  String name = StringArgumentType.getString(ctx, "name").trim();
+
+                  LinkedHashMap<String, JsonObject> kits = KitStorage.read(server, player.getUUID());
+                  if (kits.remove(name) == null) {
+                      src.sendFailure(Component.literal("Kit '" + name + "' tidak ditemukan."));
+                      return 0;
+                  }
+                  KitStorage.write(server, player.getUUID(), kits);
+                  src.sendSuccess(() -> Component.literal("Kit '" + name + "' dihapus.")
+                          .withStyle(ChatFormatting.YELLOW), false);
+                  return 1;
+              }
+
+              private static int open(CommandContext<CommandSourceStack> ctx) throws CommandSyntaxException {
+                  CommandSourceStack src = ctx.getSource();
+                  ServerPlayer player = src.getPlayerOrException();
+                  MinecraftServer server = src.getServer();
+
+                  LinkedHashMap<String, JsonObject> kits = KitStorage.read(server, player.getUUID());
+                  if (kits.isEmpty()) {
+                      src.sendFailure(Component.literal("Kamu belum punya kit. Pakai /kit add <nama>."));
+                      return 0;
+                  }
+
+                  List<String> names = new ArrayList<>(kits.keySet());
+                  SimpleContainer container = new SimpleContainer(54);
+                  for (int i = 0; i < names.size() && i < 54; i++) {
+                      container.setItem(i, icon(names.get(i), kits.get(names.get(i)).size()));
+                  }
+
+                  player.openMenu(new SimpleMenuProvider(
+                          (id, inv, p) -> new KitMenu(id, inv, container, names, server),
+                          Component.literal("Elsigma Kits")));
+                  return 1;
+              }
+
+              private static ItemStack icon(String name, int itemCount) {
+                  ItemStack stack = new ItemStack(Items.NETHERITE_BLOCK);
+                  stack.set(DataComponents.CUSTOM_NAME, Component.literal(name)
+                          .withStyle(Style.EMPTY.withItalic(false).withBold(true).withColor(ChatFormatting.GOLD)));
+                  stack.set(DataComponents.LORE, new ItemLore(List.of(
+                          Component.literal(itemCount + " slot tersimpan")
+                                  .withStyle(Style.EMPTY.withItalic(false).withColor(ChatFormatting.GRAY)),
+                          Component.literal("Klik untuk memuat kit ini")
+                                  .withStyle(Style.EMPTY.withItalic(false).withColor(ChatFormatting.GREEN)))));
+                  return stack;
+              }
+          }
+          EOF_FILE_7
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: current
+      - run: gradle build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: elsigma-kit-jar
+          path: build/libs/*.jar
